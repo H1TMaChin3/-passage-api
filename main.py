@@ -11,7 +11,7 @@ import tempfile, os, re, uuid
 from datetime import datetime
 from typing import Optional
 
-app = FastAPI(title="PASSAGE API", version="1.0.0",
+app = FastAPI(title="PASSAGE API", version="1.0.1",
               description="KANTEKANT Group — Document transformation engine")
 
 app.add_middleware(
@@ -23,12 +23,13 @@ app.add_middleware(
 )
 
 MARCHES_PARAMS = {
-    "Maroc":      {"transport": 10.0, "douane": 2.5,  "marge": 22.0},
-    "Mayotte":    {"transport": 8.0,  "douane": 5.0,  "marge": 20.0},
-    "Caraïbe":    {"transport": 12.0, "douane": 5.0,  "marge": 25.0},
-    "France":     {"transport": 6.0,  "douane": 0.0,  "marge": 18.0},
-    "Guyane":     {"transport": 10.0, "douane": 3.0,  "marge": 20.0},
-    "Guadeloupe": {"transport": 10.0, "douane": 3.0,  "marge": 20.0},
+    "Maroc":       {"transport": 10.0, "douane": 2.5,  "marge": 22.0},
+    "Mayotte":     {"transport": 8.0,  "douane": 5.0,  "marge": 20.0},
+    "Caraïbe":     {"transport": 12.0, "douane": 5.0,  "marge": 25.0},
+    "Martinique":  {"transport": 10.0, "douane": 3.0,  "marge": 22.0},
+    "France":      {"transport": 6.0,  "douane": 0.0,  "marge": 18.0},
+    "Guyane":      {"transport": 10.0, "douane": 3.0,  "marge": 20.0},
+    "Guadeloupe":  {"transport": 10.0, "douane": 3.0,  "marge": 20.0},
 }
 
 SOCIETE = {
@@ -43,7 +44,7 @@ SOCIETE = {
 def root():
     return {
         "app": "PASSAGE",
-        "version": "1.0.0",
+        "version": "1.0.1",
         "groupe": "KANTEKANT",
         "status": "operational",
         "endpoints": ["/transform", "/health", "/marches"]
@@ -61,7 +62,7 @@ def get_marches():
 async def transform_document(
     file: UploadFile = File(...),
     filiale: str = Form("B.E Energies"),
-    marche: str = Form("Maroc"),
+    marche: str = Form("Martinique"),
     devise_source: str = Form("USD"),
     taux_change: float = Form(0.92),
     transport_pct: Optional[float] = Form(None),
@@ -70,19 +71,12 @@ async def transform_document(
     client_nom: Optional[str] = Form(""),
     masquer_fournisseur: bool = Form(True),
 ):
-    """
-    Transforme un document fournisseur en document B.E Company.
-    Accepte : PDF, DOCX, XLSX
-    Retourne : PDF généré
-    """
-
     # Paramètres du marché
-    params = MARCHES_PARAMS.get(marche, MARCHES_PARAMS["Maroc"])
+    params = dict(MARCHES_PARAMS.get(marche, MARCHES_PARAMS["Martinique"]))
     if transport_pct is not None: params["transport"] = transport_pct
     if douane_pct is not None:    params["douane"]    = douane_pct
     if marge_pct is not None:     params["marge"]     = marge_pct
 
-    # Sauvegarde temporaire du fichier uploadé
     suffix = os.path.splitext(file.filename)[1].lower()
     tmp_dir = tempfile.mkdtemp()
     input_path = os.path.join(tmp_dir, f"input{suffix}")
@@ -91,7 +85,6 @@ async def transform_document(
         content = await file.read()
         f.write(content)
 
-    # Extraction selon format
     try:
         if suffix == ".pdf":
             produits, titre = extraire_pdf(input_path)
@@ -109,12 +102,10 @@ async def transform_document(
         raise HTTPException(status_code=422,
             detail="Aucun produit/prix détecté dans ce document.")
 
-    # Calcul des prix clients
     for p in produits:
         p["prix_client"] = calculer_prix(
             p.get("prix_source"), devise_source, taux_change, params)
 
-    # Génération PDF
     ref = f"{filiale.replace('.','').replace(' ','-').upper()}-{marche[:3].upper()}-{datetime.now().strftime('%Y%m%d%H%M')}"
     output_path = os.path.join(tmp_dir, f"PASSAGE_{ref}.pdf")
 
@@ -143,42 +134,112 @@ async def transform_document(
     )
 
 
-# ── EXTRACTION PDF ──
+# ── EXTRACTION PDF ── CORRIGÉE ──
 def extraire_pdf(path):
     import pdfplumber
-    produits, titre = [], ""
+    produits, titre = [], []
+    refs_vus = set()
+
     with pdfplumber.open(path) as pdf:
         for i, page in enumerate(pdf.pages):
+            text = page.extract_text() or ""
             if i == 0:
-                for l in (page.extract_text() or "").split("\n"):
-                    if any(x in l for x in ["Quotation","Quote","报价","价格","Price"]):
+                for l in text.split("\n"):
+                    if any(x in l for x in ["Quotation","Quote","报价","价格","Price","Devis","DEVIS"]):
                         titre = l.strip(); break
+
             for table in page.extract_tables():
                 if not table: continue
-                hdr = " ".join(str(c) for c in (table[0] or []) if c).lower()
-                # Format 5 colonnes (CHREDSUN style)
-                if "item" in hdr or "no." in hdr:
-                    ncols = len(table[0] or [])
+                hdr_cells = table[0] or []
+                hdr = " ".join(str(c) for c in hdr_cells if c).lower()
+
+                if "item" in hdr or "no." in hdr or "description" in hdr:
                     for row in table[1:]:
                         if not row: continue
-                        no = str(row[0]).strip() if row[0] else ""
-                        if not no.isdigit(): continue
-                        ref = str(row[1]).strip().replace("\n","-") if len(row)>1 and row[1] else ""
-                        # Détecter prix selon nombre de colonnes
-                        if ncols >= 7:
-                            prix = parse_prix(row[6] if len(row)>6 and row[6] else "")
+                        row = [str(c).strip() if c else "" for c in row]
+                        ncols = len(row)
+
+                        # Numéro de ligne
+                        no = row[0] if row[0] else ""
+                        if not no.isdigit():
+                            continue
+
+                        # Référence (col 1)
+                        ref_prod = row[1].replace("\n", "-") if ncols > 1 else ""
+                        ref_prod = ref_prod.strip()
+
+                        # Éviter doublons
+                        if ref_prod and ref_prod in refs_vus:
+                            continue
+
+                        # Description (col 3 si >=5 cols, sinon col 2)
+                        if ncols >= 5:
+                            desc_raw = row[3] if row[3] else (row[2] if row[2] else ref_prod)
                         else:
-                            prix = parse_prix_bulk(row[2] if len(row)>2 and row[2] else "")
-                        desc = str(row[3]).split("\n")[0] if len(row)>3 and row[3] else ref
-                        qty = str(row[4]).strip() if len(row)>4 and row[4] else ""
-                        if ref:
+                            desc_raw = row[2] if ncols > 2 and row[2] else ref_prod
+                        desc = desc_raw.split("\n")[0].strip()
+
+                        # Quantité (col 4)
+                        qty = row[4].strip() if ncols > 4 else ""
+
+                        # ── PRIX : logique améliorée ──
+                        prix = None
+
+                        # Cas 1 : colonne prix dédiée (col 6 ou 7)
+                        for col_idx in [6, 7, 5]:
+                            if ncols > col_idx and row[col_idx]:
+                                prix = parse_prix_cellule(row[col_idx])
+                                if prix: break
+
+                        # Cas 2 : prix dans la cellule description (multi-lignes CHREDSUN style)
+                        if not prix:
+                            for cell in row:
+                                if cell:
+                                    prix = parse_prix_cellule(cell)
+                                    if prix: break
+
+                        if ref_prod or prix:
+                            refs_vus.add(ref_prod)
                             produits.append({
-                                "no": no, "ref": ref,
+                                "no": no,
+                                "ref": ref_prod or f"REF-{no}",
                                 "desc": traduire(desc),
                                 "prix_source": prix,
                                 "qte": qty,
                             })
-    return produits, titre
+
+    return produits, titre or "Document fournisseur"
+
+
+def parse_prix_cellule(cellule):
+    """
+    Extrait le premier prix valide d'une cellule — même multi-lignes.
+    Priorité : prix 'Sample' ou premier prix listé (pas les prix >=100, >=300 etc.)
+    """
+    if not cellule:
+        return None
+    text = str(cellule)
+    lignes = text.split("\n")
+
+    # Cherche d'abord une ligne contenant "Sample" avec un prix
+    for ligne in lignes:
+        if "sample" in ligne.lower() or "échantillon" in ligne.lower():
+            p = parse_prix(ligne)
+            if p and p > 0.5:
+                return p
+
+    # Sinon prend le premier prix trouvé qui n'est pas précédé de ">="
+    for ligne in lignes:
+        ligne_stripped = ligne.strip()
+        if ligne_stripped.startswith(">=") or ligne_stripped.startswith(">"):
+            continue
+        p = parse_prix(ligne_stripped)
+        if p and p > 0.5:
+            return p
+
+    # Dernier recours : n'importe quel prix dans la cellule entière
+    return parse_prix(text)
+
 
 def extraire_excel(path):
     import openpyxl
@@ -187,13 +248,11 @@ def extraire_excel(path):
     ws = wb.active
     rows = list(ws.iter_rows(values_only=True))
     if not rows: return produits, titre
-    # Chercher ligne d'en-tête
     header_row = 0
     for i, row in enumerate(rows[:10]):
         row_str = " ".join(str(c) for c in row if c).lower()
         if any(x in row_str for x in ["price","prix","model","item","产品"]):
-            header_row = i
-            break
+            header_row = i; break
     for row in rows[header_row+1:]:
         if not any(row): continue
         cells = [str(c).strip() if c is not None else "" for c in row]
@@ -282,6 +341,8 @@ def traduire(t):
         ("Aluminum Plate for","Plaques aluminium pour"),
         ("Electrolyte Powder for","Poudre électrolyte pour"),
         ("emergency power generator","générateur secours"),
+        ("Accessories of Three Disruptions","Système urgence 3 ruptures"),
+        ("Emergency Communication and Power","Communication & énergie d'urgence"),
         ("Salt Water","Eau salée"),("Flashlight","Lampe torche"),
         ("Portable","Portable"),("Generator","Générateur"),
     ]
@@ -316,7 +377,6 @@ def generer_pdf_be(produits, titre_source, filiale, marche, params,
     S = lambda name, **kw: ParagraphStyle(name, parent=styles["Normal"], **kw)
     story = []
 
-    # En-tête
     hd = [[
         Paragraph(filiale, S("n", fontSize=20, fontName="Helvetica-Bold",
                              textColor=NOIR, spaceAfter=2)),
@@ -336,7 +396,6 @@ def generer_pdf_be(produits, titre_source, filiale, marche, params,
     story.append(HRFlowable(width="100%", thickness=2.5, color=ROUGE, spaceAfter=3))
     story.append(HRFlowable(width="100%", thickness=0.4, color=GRIS_B, spaceAfter=10))
 
-    # Titre + infos marché
     story.append(Paragraph(f"Offre commerciale — {marche}",
         S("oc", fontSize=13, fontName="Helvetica-Bold", textColor=ROUGE,
           alignment=TA_CENTER, spaceAfter=3)))
@@ -350,7 +409,6 @@ def generer_pdf_be(produits, titre_source, filiale, marche, params,
         f"Date : {datetime.now().strftime('%d/%m/%Y')}",
         S("note", fontSize=8.5, textColor=GRIS, spaceAfter=14)))
 
-    # Tableau produits
     sym = "€"
     data = [["N°", "Référence", "Description", f"Prix client ({sym})"]]
     for p in produits:
@@ -381,7 +439,6 @@ def generer_pdf_be(produits, titre_source, filiale, marche, params,
     story.append(t)
     story.append(Spacer(1,14))
 
-    # Conditions
     story.append(HRFlowable(width="100%",thickness=0.5,color=GRIS_B,spaceAfter=8))
     conds = [
         ("Paiement", "50% acompte à la commande · Solde avant expédition"),
