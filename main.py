@@ -150,11 +150,18 @@ def extraire_pdf(path):
 
             for table in page.extract_tables():
                 if not table: continue
-                hdr_cells = table[0] or []
-                hdr = " ".join(str(c) for c in hdr_cells if c).lower()
 
-                if "item" in hdr or "no." in hdr or "description" in hdr:
-                    for row in table[1:]:
+                # Cherche la ligne d'en-tête sur les 3 premières lignes
+                header_idx = None
+                for hi, hrow in enumerate(table[:3]):
+                    hdr = " ".join(str(c) for c in (hrow or []) if c).lower()
+                    if "item" in hdr or "no." in hdr or "description" in hdr:
+                        header_idx = hi
+                        break
+                if header_idx is None:
+                    continue
+
+                for row in table[header_idx+1:]:
                         if not row: continue
                         row = [str(c).strip() if c else "" for c in row]
                         ncols = len(row)
