@@ -2,7 +2,7 @@
 PASSAGE Backend — FastAPI
 KANTEKANT Group · B.E Company
 Jéricho BOURA · ktkintel@gmail.com
-v1.1.1 — Fix descriptions multi-lignes + traductions manquantes
+v1.1.3 — Fix descriptions multi-lignes + traductions manquantes
 """
 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
@@ -16,7 +16,7 @@ from typing import Optional
 from translate import translate_designations, detect_language
 from translate_router import router as translate_router
 
-app = FastAPI(title="PASSAGE API", version="1.1.1",
+app = FastAPI(title="PASSAGE API", version="1.1.3",
               description="KANTEKANT Group — Document transformation engine")
 
 app.add_middleware(
@@ -192,31 +192,55 @@ def _traduire_local(t: str) -> str:
 
 def _nettoyer_desc(desc_raw: str) -> str:
     """
-    Reconstruit une description propre depuis une cellule multi-lignes.
-    - Prend les 2 premières lignes significatives (pas juste la 1ère)
-    - Filtre les lignes qui sont des specs techniques pures (Rated Power, Size...)
-    - Tronque à 80 caractères max
+    v1.1.3 — Reconstruction description propre.
+    Stratégie : garder uniquement les lignes NOM DE PRODUIT.
+    Tout spec, note, condition commerciale est éliminé.
     """
     if not desc_raw:
         return ""
-    # Séparer les lignes
     lines = [l.strip() for l in desc_raw.replace("\r", "\n").split("\n") if l.strip()]
     if not lines:
         return ""
 
-    # Filtrer les lignes qui sont purement des specs (à exclure du titre)
-    specs_prefixes = (
-        "rated power", "size:", "output", "input", "voltage", "capacity",
-        "intelligent", "ac220v", "dc12v", "usb ", "type-c", "use:",
-        ">=", "pcs", "set", "sample"
+    EXCLURE_PREFIXES = (
+        "rated power", "related power", "maximum power", "rated energy",
+        "size:", "net weight", "output voltage", "output:", "input",
+        "voltage", "capacity", "frequency", "usb output",
+        "intelligent", "ac220v", "ac 220", "dc12v", "dc 12",
+        "usb ", "type-c", "use:", "lifespan", "lifetime",
+        "working time", "total power", "working voltage",
+        ">=", "pcs", "sets", "sample",
+        "can continuous", "can be used", "can charge",
+        "the client", "the outer", "the aluminum", "the consumed",
+        "people can", "it adapts", "no matter", "equipped with",
+        "compared to", "our water", "self-generating",
+        "for adding", "for 6 hours", "for 24 hours", "adding electrolyte",
+        "payment", "lead time", "remark", "bill of lading",
+        "bulk order", "samples:", "80g/pc", "4pcs/set", "10pcs/set",
+        "4 aluminum", "8 aluminum", "12 aluminum",
     )
-    titre_lines = [l for l in lines
-                   if not any(l.lower().startswith(p) for p in specs_prefixes)]
+    EXCLURE_CONTIENT = (
+        "potassium hydroxide", "electrolyte liquid", "electrolyte solution",
+        "bill of lading", "lead time", "payment term",
+        "aluminum plate needs", "replaced every",
+        "chredsun", "redsun", "sales68",
+        "/pc,", "g/pc", "pcs/set",
+    )
 
-    # Prendre les 2 premières lignes de titre reconstituées
-    desc = " ".join(titre_lines[:2]) if titre_lines else " ".join(lines[:2])
+    def est_titre(ligne: str) -> bool:
+        l = ligne.lower()
+        if any(l.startswith(p) for p in EXCLURE_PREFIXES):
+            return False
+        if any(p in l for p in EXCLURE_CONTIENT):
+            return False
+        if re.fullmatch(r'[\d\s\-x×/.,:%°kmwhwvaz]+', l):
+            return False
+        if len(ligne) < 4:
+            return False
+        return True
 
-    # Tronquer proprement
+    titre_lines = [l for l in lines if est_titre(l)]
+    desc = " ".join(titre_lines[:2]) if titre_lines else lines[0]
     if len(desc) > 80:
         desc = desc[:80]
     return desc.strip()
@@ -298,26 +322,47 @@ def extraire_pdf(path):
 
 
 def parse_prix_cellule(cellule):
+    """
+    v1.1.3 — Extraction prix intelligente.
+    - Ignore les lignes "Sample" sans prix associé
+    - Ignore les lignes >= (prix dégressifs)
+    - Seuil minimum 5.0 USD pour éviter faux positifs
+    - Priorité au premier prix réel non conditionnel
+    """
     if not cellule:
         return None
     text = str(cellule)
-    lignes = text.split("\n")
+    lignes = [l.strip() for l in text.split("\n") if l.strip()]
 
+    # Passe 1 : cherche un prix explicite sur une ligne "Sample"
     for ligne in lignes:
         if "sample" in ligne.lower() or "échantillon" in ligne.lower():
             p = parse_prix(ligne)
-            if p and p > 0.5:
+            if p and p > 5.0:
                 return p
 
+    # Passe 2 : collecter tous les candidats non conditionnels
+    # Prendre le MAX pour éviter les faux positifs (Hz, V, W parasites)
+    candidats = []
     for ligne in lignes:
-        ligne_stripped = ligne.strip()
-        if ligne_stripped.startswith(">=") or ligne_stripped.startswith(">"):
+        if ligne.startswith(">=") or ligne.startswith(">"):
             continue
-        p = parse_prix(ligne_stripped)
-        if p and p > 0.5:
+        if re.fullmatch(r'[\d,. ]+', ligne):
+            continue
+        p = parse_prix(ligne)
+        if p and p > 5.0:
+            candidats.append(p)
+
+    if candidats:
+        return max(candidats)
+
+    # Passe 3 : fallback — prix dégressif (>=)
+    for ligne in lignes:
+        p = parse_prix(ligne)
+        if p and p > 5.0:
             return p
 
-    return parse_prix(text)
+    return None
 
 
 def extraire_excel(path):
