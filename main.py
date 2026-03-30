@@ -2,21 +2,24 @@
 PASSAGE Backend — FastAPI
 KANTEKANT Group · B.E Company
 Jéricho BOURA · ktkintel@gmail.com
-v1.1.3 — Fix descriptions multi-lignes + traductions manquantes
+v1.2.0 — Parser Claude universel (extrait + traduit + nettoie en un seul appel)
 """
 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
-import tempfile, os, re, uuid
+from fastapi.responses import FileResponse
+import tempfile, os, re, json
 from datetime import datetime
 from typing import Optional
+import anthropic
 
 # ── MODULE TRADUCTION ──
-from translate import translate_designations, detect_language
 from translate_router import router as translate_router
 
-app = FastAPI(title="PASSAGE API", version="1.1.3",
+_client = anthropic.Anthropic()
+MODEL   = "claude-sonnet-4-20250514"
+
+app = FastAPI(title="PASSAGE API", version="1.2.0",
               description="KANTEKANT Group — Document transformation engine")
 
 app.add_middleware(
@@ -51,11 +54,12 @@ SOCIETE = {
 def root():
     return {
         "app": "PASSAGE",
-        "version": "1.1.1",
+        "version": "1.2.0",
         "groupe": "KANTEKANT",
         "status": "operational",
-        "endpoints": ["/transform", "/health", "/marches", "/translate/designations",
-                      "/translate/blocks", "/translate/text", "/translate/detect"]
+        "endpoints": ["/transform", "/health", "/marches",
+                      "/translate/designations", "/translate/blocks",
+                      "/translate/text", "/translate/detect"]
     }
 
 @app.get("/health")
@@ -94,7 +98,7 @@ async def transform_document(
 
     try:
         if suffix == ".pdf":
-            produits, titre = extraire_pdf(input_path)
+            produits, titre = extraire_pdf_claude(input_path)
         elif suffix in [".xlsx", ".xls"]:
             produits, titre = extraire_excel(input_path)
         elif suffix == ".docx":
@@ -108,12 +112,6 @@ async def transform_document(
     if not produits:
         raise HTTPException(status_code=422,
             detail="Aucun produit/prix détecté dans ce document.")
-
-    # ── TRADUCTION GROUPÉE ──
-    descs_brutes = [p.get("desc", "") for p in produits]
-    descs_fr     = traduire_lot(descs_brutes)
-    for p, desc_fr in zip(produits, descs_fr):
-        p["desc"] = desc_fr
 
     for p in produits:
         p["prix_client"] = calculer_prix(
@@ -148,222 +146,121 @@ async def transform_document(
 
 
 # ══════════════════════════════════════════════════════════════════
-# TRADUCTION
+# EXTRACTION v1.2.0 — PARSER CLAUDE UNIVERSEL
 # ══════════════════════════════════════════════════════════════════
 
-def traduire_lot(descriptions: list[str]) -> list[str]:
-    if not descriptions:
-        return descriptions
-    non_vides = [d for d in descriptions if d and d.strip()]
-    if not non_vides:
-        return descriptions
-    try:
-        return translate_designations(descriptions)
-    except Exception as e:
-        print(f"[PASSAGE] Fallback traduction locale (erreur API: {e})")
-        return [_traduire_local(d) for d in descriptions]
+SYSTEM_PARSER = """Tu es le moteur d'extraction de PASSAGE, système de sourcing de KANTEKANT Group (Martinique).
 
+Tu reçois le texte brut extrait d'un catalogue ou devis fournisseur étranger (anglais, chinois, coréen).
 
-def _traduire_local(t: str) -> str:
-    if not t:
-        return t
-    subs = [
-        ("Emergency Water Power Generator", "Générateur d'énergie eau d'urgence"),
-        ("Emergency Water Power", "Énergie eau d'urgence"),
-        ("emergency power generator", "Générateur de secours"),
-        ("Water-activated EV Power Generator for cars", "Générateur EV eau — coffre voiture"),
-        ("Water-activated EV Power Generator", "Générateur EV à activation par eau"),
-        ("Aluminum Plates for", "Plaques aluminium pour"),
-        ("Aluminum Plate for", "Plaque aluminium pour"),
-        ("Electrolyte Powder for", "Poudre électrolyte pour"),
-        ("Accessories of Three Disruptions", "Système urgence 3 ruptures"),
-        ("Emergency Communication and Power", "Communication & énergie d'urgence"),
-        ("Salt Water", "Eau salée"), ("Flashlight", "Lampe torche"),
-        ("Generator", "Générateur"), ("Portable", "Portable"),
-    ]
-    for en, fr in subs:
-        t = t.replace(en, fr)
-    return t
+Ta mission : extraire UNIQUEMENT les produits commerciaux avec leur prix unitaire réel.
 
+RÈGLES ABSOLUES :
+1. Retourne UNIQUEMENT du JSON valide, sans markdown, sans explication.
+2. Format : {"titre": "...", "produits": [{"no": "1", "ref": "CODE", "desc": "Nom FR propre", "prix": 123.45}, ...]}
+3. "desc" : nom commercial court en français professionnel (max 60 chars). PAS de specs techniques.
+4. "prix" : prix unitaire réel en USD/devise source. 
+   - Prendre le prix Sample s'il existe, sinon le premier prix non conditionnel
+   - IGNORER : durées de vie (hours), puissances (W, KW), tensions (V), dimensions (mm), poids (g/kg)
+   - IGNORER : prix dégressifs (>=100pcs, >=200pcs) — prendre le prix Sample ou premier prix standard
+   - Si aucun prix réel : null
+5. SUPPRIMER de "desc" : noms fournisseur, adresses, emails, téléphones, specs électriques, notes client
+6. "no" : numéro de ligne du tableau (1, 2, 3...)
+7. "ref" : code produit exact (ex: RS-AL-150W, GS001-10W-P) — ne pas modifier
+8. Ignorer les lignes "Remark", conditions de paiement, délais, descriptions marketing longues"""
 
-# ══════════════════════════════════════════════════════════════════
-# EXTRACTION PDF — v1.1.1 : descriptions multi-lignes reconstituées
-# ══════════════════════════════════════════════════════════════════
-
-def _nettoyer_desc(desc_raw: str) -> str:
+def extraire_pdf_claude(path: str):
     """
-    v1.1.3 — Reconstruction description propre.
-    Stratégie : garder uniquement les lignes NOM DE PRODUIT.
-    Tout spec, note, condition commerciale est éliminé.
+    v1.2.0 — Extraction universelle via Claude API.
+    Lit le texte brut du PDF et demande à Claude d'extraire
+    les produits proprement — ref, description FR, prix réel.
     """
-    if not desc_raw:
-        return ""
-    lines = [l.strip() for l in desc_raw.replace("\r", "\n").split("\n") if l.strip()]
-    if not lines:
-        return ""
-
-    EXCLURE_PREFIXES = (
-        "rated power", "related power", "maximum power", "rated energy",
-        "size:", "net weight", "output voltage", "output:", "input",
-        "voltage", "capacity", "frequency", "usb output",
-        "intelligent", "ac220v", "ac 220", "dc12v", "dc 12",
-        "usb ", "type-c", "use:", "lifespan", "lifetime",
-        "working time", "total power", "working voltage",
-        ">=", "pcs", "sets", "sample",
-        "can continuous", "can be used", "can charge",
-        "the client", "the outer", "the aluminum", "the consumed",
-        "people can", "it adapts", "no matter", "equipped with",
-        "compared to", "our water", "self-generating",
-        "for adding", "for 6 hours", "for 24 hours", "adding electrolyte",
-        "payment", "lead time", "remark", "bill of lading",
-        "bulk order", "samples:", "80g/pc", "4pcs/set", "10pcs/set",
-        "4 aluminum", "8 aluminum", "12 aluminum",
-    )
-    EXCLURE_CONTIENT = (
-        "potassium hydroxide", "electrolyte liquid", "electrolyte solution",
-        "bill of lading", "lead time", "payment term",
-        "aluminum plate needs", "replaced every",
-        "chredsun", "redsun", "sales68",
-        "/pc,", "g/pc", "pcs/set",
-    )
-
-    def est_titre(ligne: str) -> bool:
-        l = ligne.lower()
-        if any(l.startswith(p) for p in EXCLURE_PREFIXES):
-            return False
-        if any(p in l for p in EXCLURE_CONTIENT):
-            return False
-        if re.fullmatch(r'[\d\s\-x×/.,:%°kmwhwvaz]+', l):
-            return False
-        if len(ligne) < 4:
-            return False
-        return True
-
-    titre_lines = [l for l in lines if est_titre(l)]
-    desc = " ".join(titre_lines[:2]) if titre_lines else lines[0]
-    if len(desc) > 80:
-        desc = desc[:80]
-    return desc.strip()
-
-
-def extraire_pdf(path):
     import pdfplumber
-    produits, titre = [], []
-    refs_vus = set()
 
+    # ── Extraction texte brut ──
+    texte_pages = []
     with pdfplumber.open(path) as pdf:
-        for i, page in enumerate(pdf.pages):
-            text = page.extract_text() or ""
-            if i == 0:
-                for l in text.split("\n"):
-                    if any(x in l for x in ["Quotation","Quote","报价","价格","Price","Devis","DEVIS"]):
-                        titre = l.strip(); break
+        for page in pdf.pages:
+            t = page.extract_text()
+            if t and t.strip():
+                texte_pages.append(t.strip())
 
-            for table in page.extract_tables():
-                if not table: continue
+    if not texte_pages:
+        return [], "Document fournisseur"
 
-                header_idx = None
-                for hi, hrow in enumerate(table[:3]):
-                    hdr = " ".join(str(c) for c in (hrow or []) if c).lower()
-                    if "item" in hdr or "no." in hdr or "description" in hdr:
-                        header_idx = hi
-                        break
-                if header_idx is None:
-                    continue
+    texte_complet = "\n\n--- PAGE ---\n\n".join(texte_pages)
 
-                for row in table[header_idx+1:]:
-                    if not row: continue
-                    row = [str(c).strip() if c else "" for c in row]
-                    ncols = len(row)
+    # Limiter à 12000 chars pour éviter timeout (les catalogues longs ont des répétitions)
+    if len(texte_complet) > 12000:
+        texte_complet = texte_complet[:12000] + "\n[...tronqué]"
 
-                    no = row[0] if row[0] else ""
-                    if not no.isdigit():
-                        continue
+    # ── Appel Claude ──
+    user_prompt = f"""Voici le texte extrait d'un catalogue/devis fournisseur.
+Extrais tous les produits selon les règles.
 
-                    ref_prod = row[1].replace("\n", "-") if ncols > 1 else ""
-                    ref_prod = ref_prod.strip()
+TEXTE SOURCE :
+{texte_complet}"""
 
-                    if ref_prod and ref_prod in refs_vus:
-                        continue
+    response = _client.messages.create(
+        model=MODEL,
+        max_tokens=3000,
+        system=SYSTEM_PARSER,
+        messages=[{"role": "user", "content": user_prompt}]
+    )
 
-                    if ncols >= 5:
-                        desc_raw = row[3] if row[3] else (row[2] if row[2] else ref_prod)
-                    else:
-                        desc_raw = row[2] if ncols > 2 and row[2] else ref_prod
+    raw = response.content[0].text.strip()
 
-                    # ── PATCH v1.1.1 : description multi-lignes reconstituée ──
-                    desc = _nettoyer_desc(desc_raw)
-                    if not desc:
-                        desc = ref_prod  # fallback sur la référence
+    # ── Parsing JSON ──
+    try:
+        # Nettoyer éventuels backticks
+        raw_clean = re.sub(r'```(?:json)?', '', raw).strip()
+        data = json.loads(raw_clean)
+    except json.JSONDecodeError:
+        # Fallback : extraire le JSON depuis le texte
+        m = re.search(r'\{.*\}', raw, re.DOTALL)
+        if m:
+            try:
+                data = json.loads(m.group())
+            except:
+                return [], "Document fournisseur"
+        else:
+            return [], "Document fournisseur"
 
-                    prix = None
-                    for col_idx in [6, 7, 5]:
-                        if ncols > col_idx and row[col_idx]:
-                            prix = parse_prix_cellule(row[col_idx])
-                            if prix: break
+    titre = data.get("titre", "Document fournisseur") or "Document fournisseur"
+    produits_raw = data.get("produits", [])
 
-                    if not prix:
-                        for cell in row:
-                            if cell:
-                                prix = parse_prix_cellule(cell)
-                                if prix: break
+    produits = []
+    for p in produits_raw:
+        ref  = str(p.get("ref", "")).strip()
+        desc = str(p.get("desc", "")).strip()
+        no   = str(p.get("no", str(len(produits)+1))).strip()
+        prix_raw = p.get("prix")
 
-                    if ref_prod or prix:
-                        refs_vus.add(ref_prod)
-                        produits.append({
-                            "no": no,
-                            "ref": ref_prod or f"REF-{no}",
-                            "desc": desc,
-                            "prix_source": prix,
-                            "qte": "",
-                        })
+        # Valider le prix
+        prix = None
+        if prix_raw is not None:
+            try:
+                v = float(str(prix_raw).replace(",", ""))
+                if v > 0.5:
+                    prix = v
+            except:
+                pass
 
-    return produits, titre or "Document fournisseur"
+        if ref or desc:
+            produits.append({
+                "no": no,
+                "ref": ref or f"REF-{no}",
+                "desc": desc or ref,
+                "prix_source": prix,
+                "qte": "",
+            })
+
+    return produits, titre
 
 
-def parse_prix_cellule(cellule):
-    """
-    v1.1.3 — Extraction prix intelligente.
-    - Ignore les lignes "Sample" sans prix associé
-    - Ignore les lignes >= (prix dégressifs)
-    - Seuil minimum 5.0 USD pour éviter faux positifs
-    - Priorité au premier prix réel non conditionnel
-    """
-    if not cellule:
-        return None
-    text = str(cellule)
-    lignes = [l.strip() for l in text.split("\n") if l.strip()]
-
-    # Passe 1 : cherche un prix explicite sur une ligne "Sample"
-    for ligne in lignes:
-        if "sample" in ligne.lower() or "échantillon" in ligne.lower():
-            p = parse_prix(ligne)
-            if p and p > 5.0:
-                return p
-
-    # Passe 2 : collecter tous les candidats non conditionnels
-    # Prendre le MAX pour éviter les faux positifs (Hz, V, W parasites)
-    candidats = []
-    for ligne in lignes:
-        if ligne.startswith(">=") or ligne.startswith(">"):
-            continue
-        if re.fullmatch(r'[\d,. ]+', ligne):
-            continue
-        p = parse_prix(ligne)
-        if p and p > 5.0:
-            candidats.append(p)
-
-    if candidats:
-        return max(candidats)
-
-    # Passe 3 : fallback — prix dégressif (>=)
-    for ligne in lignes:
-        p = parse_prix(ligne)
-        if p and p > 5.0:
-            return p
-
-    return None
-
+# ══════════════════════════════════════════════════════════════════
+# EXTRACTION EXCEL / DOCX — inchangée
+# ══════════════════════════════════════════════════════════════════
 
 def extraire_excel(path):
     import openpyxl
@@ -383,7 +280,7 @@ def extraire_excel(path):
         prix = None
         for cell in cells:
             p = parse_prix(cell)
-            if p and p > 0: prix = p; break
+            if p and p > 5: prix = p; break
         desc = next((c for c in cells if len(c)>3 and
                      not c.replace(".","").replace(",","").isdigit()), "")
         if desc or prix:
@@ -409,7 +306,7 @@ def extraire_docx(path):
             prix = None
             for cell in cells:
                 p = parse_prix(cell)
-                if p and p > 0: prix = p; break
+                if p and p > 5: prix = p; break
             desc = next((c for c in cells if len(c)>3 and
                         not c.replace(".","").replace(",","").isdigit()), "")
             if desc or prix:
@@ -437,24 +334,6 @@ def parse_prix(s):
         except: pass
     return None
 
-def parse_prix_bulk(cellule):
-    if not cellule: return None
-    for l in str(cellule).split("\n"):
-        l = l.strip()
-        if l.startswith(">="): continue
-        clean = l.replace("$","").replace("/set","").replace(",","").strip()
-        try:
-            v = float(clean)
-            if v > 5: return v
-        except: pass
-        m = re.search(r"([\d,]+\.?\d*)/set", l)
-        if m:
-            try:
-                v = float(m.group(1).replace(",",""))
-                if v > 5: return v
-            except: pass
-    return None
-
 def calculer_prix(prix_source, devise, taux, params):
     if not prix_source: return None
     eur = prix_source * taux
@@ -464,7 +343,7 @@ def calculer_prix(prix_source, devise, taux, params):
 
 
 # ══════════════════════════════════════════════════════════════════
-# GÉNÉRATION PDF
+# GÉNÉRATION PDF — inchangée
 # ══════════════════════════════════════════════════════════════════
 
 def generer_pdf_be(produits, titre_source, filiale, marche, params,
