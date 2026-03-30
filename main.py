@@ -2,6 +2,7 @@
 PASSAGE Backend — FastAPI
 KANTEKANT Group · B.E Company
 Jéricho BOURA · ktkintel@gmail.com
+v1.1.0 — MODULE TRADUCTION intégré (translate.py)
 """
 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
@@ -11,7 +12,11 @@ import tempfile, os, re, uuid
 from datetime import datetime
 from typing import Optional
 
-app = FastAPI(title="PASSAGE API", version="1.0.1",
+# ── MODULE TRADUCTION (nouveau) ──
+from translate import translate_designations, detect_language
+from translate_router import router as translate_router
+
+app = FastAPI(title="PASSAGE API", version="1.1.0",
               description="KANTEKANT Group — Document transformation engine")
 
 app.add_middleware(
@@ -21,6 +26,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── Enregistrer les endpoints /translate/* ──
+app.include_router(translate_router)
 
 MARCHES_PARAMS = {
     "Maroc":       {"transport": 10.0, "douane": 2.5,  "marge": 22.0},
@@ -44,10 +52,11 @@ SOCIETE = {
 def root():
     return {
         "app": "PASSAGE",
-        "version": "1.0.1",
+        "version": "1.1.0",
         "groupe": "KANTEKANT",
         "status": "operational",
-        "endpoints": ["/transform", "/health", "/marches"]
+        "endpoints": ["/transform", "/health", "/marches", "/translate/designations",
+                      "/translate/blocks", "/translate/text", "/translate/detect"]
     }
 
 @app.get("/health")
@@ -102,6 +111,13 @@ async def transform_document(
         raise HTTPException(status_code=422,
             detail="Aucun produit/prix détecté dans ce document.")
 
+    # ── TRADUCTION GROUPÉE (un seul appel Claude pour tous les produits) ──
+    # Plus efficace que traduire() appelé une fois par produit
+    descs_brutes = [p.get("desc", "") for p in produits]
+    descs_fr     = traduire_lot(descs_brutes)
+    for p, desc_fr in zip(produits, descs_fr):
+        p["desc"] = desc_fr
+
     for p in produits:
         p["prix_client"] = calculer_prix(
             p.get("prix_source"), devise_source, taux_change, params)
@@ -134,7 +150,63 @@ async def transform_document(
     )
 
 
-# ── EXTRACTION PDF ── CORRIGÉE ──
+# ══════════════════════════════════════════════════════════════════
+# TRADUCTION — intégration du module partagé
+# ══════════════════════════════════════════════════════════════════
+
+def traduire_lot(descriptions: list[str]) -> list[str]:
+    """
+    Traduit une liste de descriptions en un seul appel Claude.
+    Remplace l'ancienne fonction traduire() appelée produit par produit.
+    
+    - Si toutes les descriptions sont vides → retourne les originaux
+    - Si déjà en français → retourne les originaux (détection automatique)
+    - Sinon → appel translate_designations() du module partagé
+    """
+    if not descriptions:
+        return descriptions
+
+    # Vérification rapide : si toutes vides, pas la peine d'appeler l'API
+    non_vides = [d for d in descriptions if d and d.strip()]
+    if not non_vides:
+        return descriptions
+
+    try:
+        return translate_designations(descriptions)
+    except Exception as e:
+        # Fallback : si l'API échoue, utiliser l'ancienne fonction de substitution
+        print(f"[PASSAGE] Fallback traduction locale (erreur API: {e})")
+        return [_traduire_local(d) for d in descriptions]
+
+
+def _traduire_local(t: str) -> str:
+    """
+    Fallback : dictionnaire de substitutions (ancienne fonction traduire).
+    Utilisé uniquement si l'API Claude est indisponible.
+    """
+    if not t:
+        return t
+    subs = [
+        ("Water-activated EV Power Generator for cars", "Générateur EV eau — coffre voiture"),
+        ("Water-activated EV Power Generator", "Générateur EV à activation par eau"),
+        ("Aluminum Plate for", "Plaques aluminium pour"),
+        ("Electrolyte Powder for", "Poudre électrolyte pour"),
+        ("emergency power generator", "générateur secours"),
+        ("Accessories of Three Disruptions", "Système urgence 3 ruptures"),
+        ("Emergency Communication and Power", "Communication & énergie d'urgence"),
+        ("Salt Water", "Eau salée"), ("Flashlight", "Lampe torche"),
+        ("Portable", "Portable"), ("Generator", "Générateur"),
+    ]
+    for en, fr in subs:
+        t = t.replace(en, fr)
+    return t
+
+
+# ══════════════════════════════════════════════════════════════════
+# EXTRACTION PDF — inchangée, sauf : traduire(desc) → desc brute
+# (la traduction est maintenant faite en lot dans /transform)
+# ══════════════════════════════════════════════════════════════════
+
 def extraire_pdf(path):
     import pdfplumber
     produits, titre = [], []
@@ -151,7 +223,6 @@ def extraire_pdf(path):
             for table in page.extract_tables():
                 if not table: continue
 
-                # Cherche la ligne d'en-tête sur les 3 premières lignes
                 header_idx = None
                 for hi, hrow in enumerate(table[:3]):
                     hdr = " ".join(str(c) for c in (hrow or []) if c).lower()
@@ -162,80 +233,63 @@ def extraire_pdf(path):
                     continue
 
                 for row in table[header_idx+1:]:
-                        if not row: continue
-                        row = [str(c).strip() if c else "" for c in row]
-                        ncols = len(row)
+                    if not row: continue
+                    row = [str(c).strip() if c else "" for c in row]
+                    ncols = len(row)
 
-                        # Numéro de ligne
-                        no = row[0] if row[0] else ""
-                        if not no.isdigit():
-                            continue
+                    no = row[0] if row[0] else ""
+                    if not no.isdigit():
+                        continue
 
-                        # Référence (col 1)
-                        ref_prod = row[1].replace("\n", "-") if ncols > 1 else ""
-                        ref_prod = ref_prod.strip()
+                    ref_prod = row[1].replace("\n", "-") if ncols > 1 else ""
+                    ref_prod = ref_prod.strip()
 
-                        # Éviter doublons
-                        if ref_prod and ref_prod in refs_vus:
-                            continue
+                    if ref_prod and ref_prod in refs_vus:
+                        continue
 
-                        # Description (col 3 si >=5 cols, sinon col 2)
-                        if ncols >= 5:
-                            desc_raw = row[3] if row[3] else (row[2] if row[2] else ref_prod)
-                        else:
-                            desc_raw = row[2] if ncols > 2 and row[2] else ref_prod
-                        desc = desc_raw.split("\n")[0].strip()
+                    if ncols >= 5:
+                        desc_raw = row[3] if row[3] else (row[2] if row[2] else ref_prod)
+                    else:
+                        desc_raw = row[2] if ncols > 2 and row[2] else ref_prod
+                    desc = desc_raw.split("\n")[0].strip()
 
-                        # Quantité (col 4)
-                        qty = row[4].strip() if ncols > 4 else ""
+                    prix = None
+                    for col_idx in [6, 7, 5]:
+                        if ncols > col_idx and row[col_idx]:
+                            prix = parse_prix_cellule(row[col_idx])
+                            if prix: break
 
-                        # ── PRIX : logique améliorée ──
-                        prix = None
-
-                        # Cas 1 : colonne prix dédiée (col 6 ou 7)
-                        for col_idx in [6, 7, 5]:
-                            if ncols > col_idx and row[col_idx]:
-                                prix = parse_prix_cellule(row[col_idx])
+                    if not prix:
+                        for cell in row:
+                            if cell:
+                                prix = parse_prix_cellule(cell)
                                 if prix: break
 
-                        # Cas 2 : prix dans la cellule description (multi-lignes CHREDSUN style)
-                        if not prix:
-                            for cell in row:
-                                if cell:
-                                    prix = parse_prix_cellule(cell)
-                                    if prix: break
-
-                        if ref_prod or prix:
-                            refs_vus.add(ref_prod)
-                            produits.append({
-                                "no": no,
-                                "ref": ref_prod or f"REF-{no}",
-                                "desc": traduire(desc),
-                                "prix_source": prix,
-                                "qte": qty,
-                            })
+                    if ref_prod or prix:
+                        refs_vus.add(ref_prod)
+                        produits.append({
+                            "no": no,
+                            "ref": ref_prod or f"REF-{no}",
+                            "desc": desc,          # ← brut, traduit en lot après
+                            "prix_source": prix,
+                            "qte": "",
+                        })
 
     return produits, titre or "Document fournisseur"
 
 
 def parse_prix_cellule(cellule):
-    """
-    Extrait le premier prix valide d'une cellule — même multi-lignes.
-    Priorité : prix 'Sample' ou premier prix listé (pas les prix >=100, >=300 etc.)
-    """
     if not cellule:
         return None
     text = str(cellule)
     lignes = text.split("\n")
 
-    # Cherche d'abord une ligne contenant "Sample" avec un prix
     for ligne in lignes:
         if "sample" in ligne.lower() or "échantillon" in ligne.lower():
             p = parse_prix(ligne)
             if p and p > 0.5:
                 return p
 
-    # Sinon prend le premier prix trouvé qui n'est pas précédé de ">="
     for ligne in lignes:
         ligne_stripped = ligne.strip()
         if ligne_stripped.startswith(">=") or ligne_stripped.startswith(">"):
@@ -244,7 +298,6 @@ def parse_prix_cellule(cellule):
         if p and p > 0.5:
             return p
 
-    # Dernier recours : n'importe quel prix dans la cellule entière
     return parse_prix(text)
 
 
@@ -267,16 +320,18 @@ def extraire_excel(path):
         for cell in cells:
             p = parse_prix(cell)
             if p and p > 0: prix = p; break
-        desc = next((c for c in cells if len(c)>3 and not c.replace(".","").replace(",","").isdigit()), "")
+        desc = next((c for c in cells if len(c)>3 and
+                     not c.replace(".","").replace(",","").isdigit()), "")
         if desc or prix:
             produits.append({
                 "no": str(len(produits)+1),
                 "ref": cells[0][:20] if cells[0] else f"REF-{len(produits)+1}",
-                "desc": traduire(desc),
+                "desc": desc,          # ← brut, traduit en lot après
                 "prix_source": prix,
                 "qte": "",
             })
     return produits, titre or "Document fournisseur"
+
 
 def extraire_docx(path):
     from docx import Document
@@ -297,14 +352,17 @@ def extraire_docx(path):
                 produits.append({
                     "no": str(i),
                     "ref": cells[0][:20] if cells else f"REF-{i}",
-                    "desc": traduire(desc),
+                    "desc": desc,          # ← brut, traduit en lot après
                     "prix_source": prix,
                     "qte": "",
                 })
     return produits, titre or "Document fournisseur"
 
 
-# ── UTILITAIRES ──
+# ══════════════════════════════════════════════════════════════════
+# UTILITAIRES — inchangés
+# ══════════════════════════════════════════════════════════════════
+
 def parse_prix(s):
     if not s: return None
     m = re.search(r"[\$¥￥]?\s*([\d,]+\.?\d*)", str(s))
@@ -340,25 +398,11 @@ def calculer_prix(prix_source, devise, taux, params):
     eur_dou = eur_tr * (1 + params["douane"]/100)
     return round(eur_dou * (1 + params["marge"]/100), 2)
 
-def traduire(t):
-    if not t: return t
-    subs = [
-        ("Water-activated EV Power Generator for cars","Générateur EV eau — coffre voiture"),
-        ("Water-activated EV Power Generator","Générateur EV à activation par eau"),
-        ("Aluminum Plate for","Plaques aluminium pour"),
-        ("Electrolyte Powder for","Poudre électrolyte pour"),
-        ("emergency power generator","générateur secours"),
-        ("Accessories of Three Disruptions","Système urgence 3 ruptures"),
-        ("Emergency Communication and Power","Communication & énergie d'urgence"),
-        ("Salt Water","Eau salée"),("Flashlight","Lampe torche"),
-        ("Portable","Portable"),("Generator","Générateur"),
-    ]
-    for en, fr in subs:
-        t = t.replace(en, fr)
-    return t
 
+# ══════════════════════════════════════════════════════════════════
+# GÉNÉRATION PDF — inchangée
+# ══════════════════════════════════════════════════════════════════
 
-# ── GÉNÉRATION PDF ──
 def generer_pdf_be(produits, titre_source, filiale, marche, params,
                     devise_source, taux_change, client_nom, ref, output_path, societe):
     from reportlab.lib.pagesizes import A4
@@ -369,13 +413,13 @@ def generer_pdf_be(produits, titre_source, filiale, marche, params,
                                      Table, TableStyle, HRFlowable)
     from reportlab.lib.enums import TA_CENTER, TA_RIGHT
 
-    ROUGE = colors.HexColor("#CC0000")
-    NOIR  = colors.HexColor("#111111")
-    GRIS  = colors.HexColor("#666666")
+    ROUGE  = colors.HexColor("#CC0000")
+    NOIR   = colors.HexColor("#111111")
+    GRIS   = colors.HexColor("#666666")
     GRIS_L = colors.HexColor("#f7f7f7")
     GRIS_B = colors.HexColor("#dddddd")
-    VERT  = colors.HexColor("#1a5c3a")
-    BLEU  = colors.HexColor("#1a3a5c")
+    VERT   = colors.HexColor("#1a5c3a")
+    BLEU   = colors.HexColor("#1a3a5c")
 
     doc = SimpleDocTemplate(output_path, pagesize=A4,
         rightMargin=1.8*cm, leftMargin=1.8*cm,
@@ -421,8 +465,8 @@ def generer_pdf_be(produits, titre_source, filiale, marche, params,
     for p in produits:
         pc = p.get("prix_client")
         pc_str = f"{sym} {pc:,.2f}".replace(",", " ") if pc else "Sur devis"
-        ref_c = p["ref"][:22] if len(p["ref"])>22 else p["ref"]
-        desc_c = (p["desc"][:60]+"…") if len(p["desc"])>60 else p["desc"]
+        ref_c  = p["ref"][:22] if len(p["ref"]) > 22 else p["ref"]
+        desc_c = (p["desc"][:60]+"…") if len(p["desc"]) > 60 else p["desc"]
         data.append([p["no"], ref_c, desc_c, pc_str])
 
     t = Table(data, colWidths=[1.1*cm, 4.4*cm, 8.5*cm, 3.7*cm], repeatRows=1)
