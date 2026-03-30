@@ -2,7 +2,7 @@
 PASSAGE Backend — FastAPI
 KANTEKANT Group · B.E Company
 Jéricho BOURA · ktkintel@gmail.com
-v1.2.0 — Parser Claude universel (extrait + traduit + nettoie en un seul appel)
+v1.2.1 — Parser Claude universel (extrait + traduit + nettoie en un seul appel)
 """
 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
@@ -16,10 +16,13 @@ import anthropic
 # ── MODULE TRADUCTION ──
 from translate_router import router as translate_router
 
-_client = anthropic.Anthropic()
+_client = None
+
+def _get_client():
+    return anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 MODEL   = "claude-sonnet-4-20250514"
 
-app = FastAPI(title="PASSAGE API", version="1.2.0",
+app = FastAPI(title="PASSAGE API", version="1.2.1",
               description="KANTEKANT Group — Document transformation engine")
 
 app.add_middleware(
@@ -201,7 +204,7 @@ Extrais tous les produits selon les règles.
 TEXTE SOURCE :
 {texte_complet}"""
 
-    response = _client.messages.create(
+    response = _get_client().messages.create(
         model=MODEL,
         max_tokens=3000,
         system=SYSTEM_PARSER,
