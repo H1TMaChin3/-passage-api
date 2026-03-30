@@ -2,7 +2,7 @@
 PASSAGE Backend — FastAPI
 KANTEKANT Group · B.E Company
 Jéricho BOURA · ktkintel@gmail.com
-v1.1.0 — MODULE TRADUCTION intégré (translate.py)
+v1.1.1 — Fix descriptions multi-lignes + traductions manquantes
 """
 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
@@ -12,11 +12,11 @@ import tempfile, os, re, uuid
 from datetime import datetime
 from typing import Optional
 
-# ── MODULE TRADUCTION (nouveau) ──
+# ── MODULE TRADUCTION ──
 from translate import translate_designations, detect_language
 from translate_router import router as translate_router
 
-app = FastAPI(title="PASSAGE API", version="1.1.0",
+app = FastAPI(title="PASSAGE API", version="1.1.1",
               description="KANTEKANT Group — Document transformation engine")
 
 app.add_middleware(
@@ -27,7 +27,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Enregistrer les endpoints /translate/* ──
 app.include_router(translate_router)
 
 MARCHES_PARAMS = {
@@ -52,7 +51,7 @@ SOCIETE = {
 def root():
     return {
         "app": "PASSAGE",
-        "version": "1.1.0",
+        "version": "1.1.1",
         "groupe": "KANTEKANT",
         "status": "operational",
         "endpoints": ["/transform", "/health", "/marches", "/translate/designations",
@@ -80,7 +79,6 @@ async def transform_document(
     client_nom: Optional[str] = Form(""),
     masquer_fournisseur: bool = Form(True),
 ):
-    # Paramètres du marché
     params = dict(MARCHES_PARAMS.get(marche, MARCHES_PARAMS["Martinique"]))
     if transport_pct is not None: params["transport"] = transport_pct
     if douane_pct is not None:    params["douane"]    = douane_pct
@@ -111,8 +109,7 @@ async def transform_document(
         raise HTTPException(status_code=422,
             detail="Aucun produit/prix détecté dans ce document.")
 
-    # ── TRADUCTION GROUPÉE (un seul appel Claude pour tous les produits) ──
-    # Plus efficace que traduire() appelé une fois par produit
+    # ── TRADUCTION GROUPÉE ──
     descs_brutes = [p.get("desc", "") for p in produits]
     descs_fr     = traduire_lot(descs_brutes)
     for p, desc_fr in zip(produits, descs_fr):
@@ -151,51 +148,38 @@ async def transform_document(
 
 
 # ══════════════════════════════════════════════════════════════════
-# TRADUCTION — intégration du module partagé
+# TRADUCTION
 # ══════════════════════════════════════════════════════════════════
 
 def traduire_lot(descriptions: list[str]) -> list[str]:
-    """
-    Traduit une liste de descriptions en un seul appel Claude.
-    Remplace l'ancienne fonction traduire() appelée produit par produit.
-    
-    - Si toutes les descriptions sont vides → retourne les originaux
-    - Si déjà en français → retourne les originaux (détection automatique)
-    - Sinon → appel translate_designations() du module partagé
-    """
     if not descriptions:
         return descriptions
-
-    # Vérification rapide : si toutes vides, pas la peine d'appeler l'API
     non_vides = [d for d in descriptions if d and d.strip()]
     if not non_vides:
         return descriptions
-
     try:
         return translate_designations(descriptions)
     except Exception as e:
-        # Fallback : si l'API échoue, utiliser l'ancienne fonction de substitution
         print(f"[PASSAGE] Fallback traduction locale (erreur API: {e})")
         return [_traduire_local(d) for d in descriptions]
 
 
 def _traduire_local(t: str) -> str:
-    """
-    Fallback : dictionnaire de substitutions (ancienne fonction traduire).
-    Utilisé uniquement si l'API Claude est indisponible.
-    """
     if not t:
         return t
     subs = [
+        ("Emergency Water Power Generator", "Générateur d'énergie eau d'urgence"),
+        ("Emergency Water Power", "Énergie eau d'urgence"),
+        ("emergency power generator", "Générateur de secours"),
         ("Water-activated EV Power Generator for cars", "Générateur EV eau — coffre voiture"),
         ("Water-activated EV Power Generator", "Générateur EV à activation par eau"),
-        ("Aluminum Plate for", "Plaques aluminium pour"),
+        ("Aluminum Plates for", "Plaques aluminium pour"),
+        ("Aluminum Plate for", "Plaque aluminium pour"),
         ("Electrolyte Powder for", "Poudre électrolyte pour"),
-        ("emergency power generator", "générateur secours"),
         ("Accessories of Three Disruptions", "Système urgence 3 ruptures"),
         ("Emergency Communication and Power", "Communication & énergie d'urgence"),
         ("Salt Water", "Eau salée"), ("Flashlight", "Lampe torche"),
-        ("Portable", "Portable"), ("Generator", "Générateur"),
+        ("Generator", "Générateur"), ("Portable", "Portable"),
     ]
     for en, fr in subs:
         t = t.replace(en, fr)
@@ -203,9 +187,40 @@ def _traduire_local(t: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════
-# EXTRACTION PDF — inchangée, sauf : traduire(desc) → desc brute
-# (la traduction est maintenant faite en lot dans /transform)
+# EXTRACTION PDF — v1.1.1 : descriptions multi-lignes reconstituées
 # ══════════════════════════════════════════════════════════════════
+
+def _nettoyer_desc(desc_raw: str) -> str:
+    """
+    Reconstruit une description propre depuis une cellule multi-lignes.
+    - Prend les 2 premières lignes significatives (pas juste la 1ère)
+    - Filtre les lignes qui sont des specs techniques pures (Rated Power, Size...)
+    - Tronque à 80 caractères max
+    """
+    if not desc_raw:
+        return ""
+    # Séparer les lignes
+    lines = [l.strip() for l in desc_raw.replace("\r", "\n").split("\n") if l.strip()]
+    if not lines:
+        return ""
+
+    # Filtrer les lignes qui sont purement des specs (à exclure du titre)
+    specs_prefixes = (
+        "rated power", "size:", "output", "input", "voltage", "capacity",
+        "intelligent", "ac220v", "dc12v", "usb ", "type-c", "use:",
+        ">=", "pcs", "set", "sample"
+    )
+    titre_lines = [l for l in lines
+                   if not any(l.lower().startswith(p) for p in specs_prefixes)]
+
+    # Prendre les 2 premières lignes de titre reconstituées
+    desc = " ".join(titre_lines[:2]) if titre_lines else " ".join(lines[:2])
+
+    # Tronquer proprement
+    if len(desc) > 80:
+        desc = desc[:80]
+    return desc.strip()
+
 
 def extraire_pdf(path):
     import pdfplumber
@@ -251,7 +266,11 @@ def extraire_pdf(path):
                         desc_raw = row[3] if row[3] else (row[2] if row[2] else ref_prod)
                     else:
                         desc_raw = row[2] if ncols > 2 and row[2] else ref_prod
-                    desc = desc_raw.split("\n")[0].strip()
+
+                    # ── PATCH v1.1.1 : description multi-lignes reconstituée ──
+                    desc = _nettoyer_desc(desc_raw)
+                    if not desc:
+                        desc = ref_prod  # fallback sur la référence
 
                     prix = None
                     for col_idx in [6, 7, 5]:
@@ -270,7 +289,7 @@ def extraire_pdf(path):
                         produits.append({
                             "no": no,
                             "ref": ref_prod or f"REF-{no}",
-                            "desc": desc,          # ← brut, traduit en lot après
+                            "desc": desc,
                             "prix_source": prix,
                             "qte": "",
                         })
@@ -326,7 +345,7 @@ def extraire_excel(path):
             produits.append({
                 "no": str(len(produits)+1),
                 "ref": cells[0][:20] if cells[0] else f"REF-{len(produits)+1}",
-                "desc": desc,          # ← brut, traduit en lot après
+                "desc": desc,
                 "prix_source": prix,
                 "qte": "",
             })
@@ -352,7 +371,7 @@ def extraire_docx(path):
                 produits.append({
                     "no": str(i),
                     "ref": cells[0][:20] if cells else f"REF-{i}",
-                    "desc": desc,          # ← brut, traduit en lot après
+                    "desc": desc,
                     "prix_source": prix,
                     "qte": "",
                 })
@@ -360,7 +379,7 @@ def extraire_docx(path):
 
 
 # ══════════════════════════════════════════════════════════════════
-# UTILITAIRES — inchangés
+# UTILITAIRES
 # ══════════════════════════════════════════════════════════════════
 
 def parse_prix(s):
@@ -400,7 +419,7 @@ def calculer_prix(prix_source, devise, taux, params):
 
 
 # ══════════════════════════════════════════════════════════════════
-# GÉNÉRATION PDF — inchangée
+# GÉNÉRATION PDF
 # ══════════════════════════════════════════════════════════════════
 
 def generer_pdf_be(produits, titre_source, filiale, marche, params,
